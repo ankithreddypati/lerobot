@@ -204,12 +204,29 @@ class Gemma3nWithExpertModel(nn.Module):
 
     def embed_image(self, image: torch.Tensor):
         """Embed image using Gemma3n vision encoder."""
-        # Use Gemma3n's vision processing
-        image_features = self.get_vlm_model().get_image_features(
-            pixel_values=image.to(dtype=self.get_vlm_model().vision_tower.timm_model.conv_stem.conv.weight.dtype)
-        )
-        # Convert to float32 for compatibility with training
-        return image_features.to(dtype=torch.float32)
+        # Ensure input is float32 to avoid dtype mismatches
+        image = image.to(dtype=torch.float32)
+        
+        # Get vision features directly from vision tower to avoid embed_vision dtype issues
+        vision_outputs = self.get_vlm_model().vision_tower(
+            pixel_values=image, do_pooling=False, return_dict=True
+        ).last_hidden_state
+        
+        # Reshape and normalize like Gemma3n does
+        vision_outputs = vision_outputs.reshape(
+            vision_outputs.shape[0],
+            self.config.vision_config.hidden_size,
+            self.config.vision_soft_tokens_per_image,
+        ).permute(0, 2, 1)
+        
+        # Apply scaling
+        vision_outputs *= self.config.vision_config.hidden_size**0.5
+        
+        # Use embed_vision but ensure float32
+        vision_outputs = vision_outputs.to(dtype=torch.float32)
+        embedded_features = self.get_vlm_model().embed_vision(inputs_embeds=vision_outputs)
+        
+        return embedded_features.to(dtype=torch.float32)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         """Embed language tokens using Gemma3n language model."""
