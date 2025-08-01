@@ -34,6 +34,7 @@ from lerobot.policies.sac.reward_model.configuration_classifier import RewardCla
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
+from lerobot.policies.gemma3nvla.configuration_gemma3nvla import Gemma3nVLAConfig
 
 
 def get_policy_class(name: str) -> PreTrainedPolicy:
@@ -74,6 +75,10 @@ def get_policy_class(name: str) -> PreTrainedPolicy:
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
         return SmolVLAPolicy
+    elif name == "gemma3nvla":
+        from lerobot.policies.gemma3nvla.modeling_gemma3nvla import Gemma3nVLAPolicy
+
+        return Gemma3nVLAPolicy
     else:
         raise NotImplementedError(f"Policy with name {name} is not implemented.")
 
@@ -97,6 +102,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SmolVLAConfig(**kwargs)
     elif policy_type == "reward_classifier":
         return RewardClassifierConfig(**kwargs)
+    elif policy_type == "gemma3nvla":
+        return Gemma3nVLAConfig(**kwargs)
     else:
         raise ValueError(f"Policy type '{policy_type}' is not available.")
 
