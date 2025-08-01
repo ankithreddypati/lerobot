@@ -1,4 +1,6 @@
-# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#!/usr/bin/env python
+
+# Copyright 2025 HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,561 +14,836 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
+"""
+Gemma3nVLA:
 
+Vision-Language-Action model based on Gemma3n-E2B.
+
+Install gemma3nvla extra dependencies:
+```bash
+pip install -e ".[gemma3nvla]"
+```
+
+Example of finetuning the gemma3nvla pretrained model:
+```bash
+python -m lerobot.scripts.train \
+--policy.path=lerobot/gemma3nvla_base \
+--dataset.repo_id=your_dataset \
+--batch_size=32 \
+--steps=200000
+```
+
+Example of finetuning from scratch:
+```bash
+python -m lerobot.scripts.train \
+--policy.type=gemma3nvla \
+--dataset.repo_id=your_dataset \
+--batch_size=32 \
+--steps=200000
+```
+"""
+
+import math
+import os
+import re
+from collections import deque
+
+import safetensors
 import torch
-from torch import nn
-from transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoProcessor,
-    Gemma3nForConditionalGeneration,
-    Gemma3nProcessor,
+import torch.nn.functional as F
+from torch import Tensor, nn
+from transformers import AutoProcessor
+
+from lerobot.constants import ACTION, OBS_STATE
+from lerobot.policies.normalize import (
+    Normalize,
+    Unnormalize,
 )
+from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.gemma3nvla.configuration_gemma3nvla import Gemma3nVLAConfig
+from lerobot.policies.gemma3nvla.gemma3n_with_expert import Gemma3nWithExpertModel
+from lerobot.policies.utils import (
+    populate_queues,
+)
+from lerobot.utils.utils import get_safe_dtype
+
+# Matches ".soNNN", optionally followed by "-something", up to the "_buffer_" marker
+_VARIANT_RE = re.compile(r"\.so\d+(?:-[\w]+)?_buffer_")
 
 
-def apply_rope(x, positions, max_wavelength=10_000):
+def canonicalise(k: str) -> str:
     """
-    Applies RoPE positions [B, L] to x [B, L, H, D].
-    Adapted for Gemma3n's RoPE implementation.
+    Remove dataset-variant markers like '.so100-blue_' or '.so100_' from a
+    normalisation-buffer key.
     """
-    d_half = x.shape[-1] // 2
-    device = x.device
-    dtype = x.dtype
-    x = x.to(torch.float32)
-
-    freq_exponents = (2.0 / x.shape[-1]) * torch.arange(d_half, dtype=torch.float32, device=device)
-    timescale = max_wavelength**freq_exponents
-    radians = positions[..., None].to(torch.float32) / timescale[None, None, :].to(torch.float32)
-
-    radians = radians[..., None, :]
-
-    sin = torch.sin(radians)
-    cos = torch.cos(radians)
-
-    x1, x2 = x.split(d_half, dim=-1)
-    res = torch.empty_like(x)
-    res[..., :d_half] = x1 * cos - x2 * sin
-    res[..., d_half:] = x2 * cos + x1 * sin
-
-    return res.to(dtype)
+    return _VARIANT_RE.sub(".buffer_", k)
 
 
-def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
-    """Calculate intermediate size for MLP layers."""
-    hidden_dim = int(2 * hidden_dim / 3)
-    hidden_dim = int(ffn_dim_multiplier * hidden_dim)
-    hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-    return hidden_dim
+def standardise_state_dict(
+    checkpoint: dict[str, torch.Tensor], ref_keys: set[str], *, verbose: bool = True
+) -> tuple[dict[str, torch.Tensor], list[str]]:
+    """
+    • Re-keys `checkpoint ` so that every entry matches the *reference* key set.
+    • If several variant keys collapse to the same canonical name we keep the
+      first one and log the collision.
+    • Returns the new dict + a list of entries that could not be matched.
+    """
+    out, collisions, unmatched = {}, {}, []
+
+    for k, v in checkpoint.items():
+        canon = canonicalise(k)
+        if canon in ref_keys:
+            if canon in out:  # duplicate after collapsing
+                collisions.setdefault(canon, []).append(k)
+            else:
+                out[canon] = v
+        else:
+            unmatched.append(k)
+
+    if verbose:
+        for canon, variants in collisions.items():
+            print(f"[standardise_state_dict] '{canon}'  ←  {variants}")
+        if unmatched:
+            print(f"[standardise_state_dict] kept {len(unmatched)} unmatched keys")
+
+    out.update({k: checkpoint[k] for k in unmatched})
+    return out, unmatched
 
 
-class Gemma3nWithExpertModel(nn.Module):
+def rename_checkpoint_keys(checkpoint: dict, rename_str: str):
+    """
+    Renames keys in a checkpoint dictionary based on the given rename string.
+    """
+    rename_dict = dict(pair.split("//") for pair in rename_str.split(","))
+
+    new_checkpoint = {}
+    for k, v in checkpoint.items():
+        for old_key, new_key in rename_dict.items():
+            if old_key in k:
+                k = k.replace(old_key, new_key)
+        new_checkpoint[k] = v
+    return new_checkpoint
+
+
+def load_gemma3nvla(
+    model: torch.nn.Module,
+    filename: str | os.PathLike,
+    *,
+    device: str = "cpu",
+    checkpoint_keys_mapping: str = "",
+) -> torch.nn.Module:
+    state_dict = safetensors.torch.load_file(filename, device=device)
+
+    # Optional user-supplied renames
+    if checkpoint_keys_mapping and "//" in checkpoint_keys_mapping:
+        state_dict = rename_checkpoint_keys(state_dict, checkpoint_keys_mapping)
+
+    state_dict, _ = standardise_state_dict(state_dict, set(model.state_dict().keys()))
+
+    # Don't overwrite normalization parameters
+    norm_keys = ("normalize_inputs", "normalize_targets", "unnormalize_outputs")
+    state_dict = {k: v for k, v in state_dict.items() if not k.startswith(norm_keys)}
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    if not all(key.startswith(norm_keys) for key in missing) or unexpected:
+        raise RuntimeError(
+            "Gemma3nVLA %d missing / %d unexpected keys",
+            len(missing),
+            len(unexpected),
+        )
+
+    return model
+
+
+def create_sinusoidal_pos_embedding(
+    time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
+) -> Tensor:
+    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    if dimension % 2 != 0:
+        raise ValueError(f"dimension ({dimension}) must be divisible by 2")
+
+    if time.ndim != 1:
+        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+
+    dtype = get_safe_dtype(torch.float64, device.type)
+    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
+    period = min_period * (max_period / min_period) ** fraction
+
+    # Compute the outer product
+    scaling_factor = 1.0 / period * 2 * math.pi
+    sin_input = scaling_factor[None, :] * time[:, None]
+    pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    return pos_emb
+
+
+def make_att_2d_masks(pad_masks, att_masks):
+    """Create 2D attention masks for causal and cross-attention patterns."""
+    if att_masks.ndim != 2:
+        raise ValueError(att_masks.ndim)
+    if pad_masks.ndim != 2:
+        raise ValueError(pad_masks.ndim)
+
+    cumsum = torch.cumsum(att_masks, dim=1)
+    att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
+    pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
+    att_2d_masks = att_2d_masks & pad_2d_masks
+    return att_2d_masks
+
+
+def resize_with_pad(img, width, height, pad_value=-1):
+    """Resize image with padding to maintain aspect ratio."""
+    if img.ndim != 4:
+        raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
+
+    cur_height, cur_width = img.shape[2:]
+
+    ratio = max(cur_width / width, cur_height / height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+    resized_img = F.interpolate(
+        img, size=(resized_height, resized_width), mode="bilinear", align_corners=False
+    )
+
+    pad_height = max(0, int(height - resized_height))
+    pad_width = max(0, int(width - resized_width))
+
+    # pad on left and top of image
+    padded_img = F.pad(resized_img, (pad_width, 0, pad_height, 0), value=pad_value)
+    return padded_img
+
+
+def pad_vector(vector, new_dim):
+    """Pad vector to new dimension."""
+    if vector.shape[-1] == new_dim:
+        return vector
+    shape = list(vector.shape)
+    current_dim = shape[-1]
+    shape[-1] = new_dim
+    new_vector = torch.zeros(*shape, dtype=vector.dtype, device=vector.device)
+    new_vector[..., :current_dim] = vector
+    return new_vector
+
+
+def normalize(x, min_val, max_val):
+    return (x - min_val) / (max_val - min_val)
+
+
+def unnormalize(x, min_val, max_val):
+    return x * (max_val - min_val) + min_val
+
+
+def safe_arcsin(value):
+    return torch.arcsin(torch.clamp(value, -1.0, 1.0))
+
+
+def aloha_gripper_to_angular(value):
+    """Convert Aloha gripper positions to angular space."""
+    value = unnormalize(value, min_val=0.01844, max_val=0.05800)
+
+    def linear_to_radian(linear_position, arm_length, horn_radius):
+        value = (horn_radius**2 + linear_position**2 - arm_length**2) / (2 * horn_radius * linear_position)
+        return safe_arcsin(value)
+
+    value = linear_to_radian(value, arm_length=0.036, horn_radius=0.022)
+    return normalize(value, min_val=0.4, max_val=1.5)
+
+
+def aloha_gripper_from_angular(value):
+    """Convert from angular space to Aloha gripper positions."""
+    value = unnormalize(value, min_val=0.4, max_val=1.5)
+    return normalize(value, min_val=-0.6213, max_val=1.4910)
+
+
+def aloha_gripper_from_angular_inv(value):
+    """Inverse of aloha_gripper_from_angular."""
+    value = unnormalize(value, min_val=-0.6213, max_val=1.4910)
+    return normalize(value, min_val=0.4, max_val=1.5)
+
+
+class Gemma3nVLAPolicy(PreTrainedPolicy):
+    """Wrapper class around VLAFlowMatching model using Gemma3n backbone."""
+
+    config_class = Gemma3nVLAConfig
+    name = "gemma3nvla"
+
     def __init__(
         self,
-        model_id: str = "google/gemma-3n-e2b-it",
-        load_vlm_weights: bool = True,
-        train_expert_only: bool = True,
-        freeze_vision_encoder: bool = False,
-        attention_mode: str = "self_attn",
-        num_expert_layers: int = -1,
-        num_vlm_layers: int = -1,
-        self_attn_every_n_layers: int = -1,
-        expert_width_multiplier: float = 0.5,
+        config: Gemma3nVLAConfig,
+        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
     ):
-        super().__init__()
-        
-        if load_vlm_weights:
-            print(f"Loading Gemma3n {model_id} weights ...")
-            self.vlm = Gemma3nForConditionalGeneration.from_pretrained(
-                model_id,
-                device_map="auto",
-                torch_dtype=torch.bfloat16,
-                low_cpu_mem_usage=True,
-                attn_implementation="sdpa",
-            )
-            config = self.vlm.config
-        else:
-            config = AutoConfig.from_pretrained(model_id)
-            self.vlm = Gemma3nForConditionalGeneration(config=config)
-            
-        # Use Gemma3n processor
-        self.processor = AutoProcessor.from_pretrained(model_id)
-        
-        # Reduce VLM layers if specified
-        if num_vlm_layers > 0:
-            print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
-            self.get_vlm_model().language_model.layers = self.get_vlm_model().language_model.layers[:num_vlm_layers]
-        
-        self.num_vlm_layers = len(self.get_vlm_model().language_model.layers)
+        super().__init__(config)
+        config.validate_features()
         self.config = config
-        
-        # Create smaller action expert based on Gemma3n text config
-        lm_expert_config = copy.deepcopy(config.text_config)
-        hidden_size = lm_expert_config.hidden_size
-        lm_expert_config.hidden_size = int(hidden_size * expert_width_multiplier)
-        expert_intermediate_size = get_intermediate_size(int(hidden_size * expert_width_multiplier))
-        lm_expert_config.intermediate_size = [expert_intermediate_size] * self.num_vlm_layers
-        lm_expert_config.num_hidden_layers = self.num_vlm_layers
-        
-        if num_expert_layers > 0:
-            assert len(self.get_vlm_model().language_model.layers) % num_expert_layers == 0, (
-                f"Number of layers in the VLM {len(self.get_vlm_model().language_model.layers)} "
-                f"are not multiple of num_expert_layers {num_expert_layers}"
-            )
-            lm_expert_config.num_hidden_layers = num_expert_layers
+        self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
+        self.normalize_targets = Normalize(
+            config.output_features, config.normalization_mapping, dataset_stats
+        )
+        self.unnormalize_outputs = Unnormalize(
+            config.output_features, config.normalization_mapping, dataset_stats
+        )
+
+        # Use Gemma3n processor instead of SmolVLM processor
+        self.language_tokenizer = AutoProcessor.from_pretrained(self.config.vlm_model_name).tokenizer
+        self.model = VLAFlowMatching(config)
+        self.reset()
+
+    def reset(self):
+        """This should be called whenever the environment is reset."""
+        self._queues = {
+            ACTION: deque(maxlen=self.config.n_action_steps),
+        }
+
+    @classmethod
+    def _load_as_safetensor(
+        cls,
+        model: "Gemma3nVLAPolicy",
+        model_file: str,
+        map_location: str,
+        strict: bool,
+    ):
+        safetensors.torch.load_model(model, model_file, strict=strict, device=map_location)
+        return load_gemma3nvla(
+            model,
+            model_file,
+            device=map_location,
+            checkpoint_keys_mapping="model._orig_mod.//model.",
+        )
+
+    def get_optim_params(self) -> dict:
+        return self.parameters()
+
+    def _get_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        for k in batch:
+            if k in self._queues and k != ACTION:
+                batch[k] = torch.stack(list(self._queues[k]), dim=1)
+
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        lang_tokens, lang_masks = self.prepare_language(batch)
+
+        actions = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state, noise=noise)
+
+        # Unpad actions
+        original_action_dim = self.config.action_feature.shape[0]
+        actions = actions[:, :, :original_action_dim]
+
+        actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
+
+        if self.config.adapt_to_pi_aloha:
+            actions = self._pi_aloha_encode_actions(actions)
+
+        return actions
+
+    def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        if self.config.adapt_to_pi_aloha:
+            batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
+
+        batch = self.normalize_inputs(batch)
+        return batch
+
+    @torch.no_grad()
+    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        self.eval()
+        batch = self._prepare_batch(batch)
+        self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+        actions = self._get_action_chunk(batch, noise)
+        return actions
+
+    @torch.no_grad()
+    def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        """Select a single action given environment observations."""
+        self.eval()
+        batch = self._prepare_batch(batch)
+        self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+
+        if len(self._queues[ACTION]) == 0:
+            actions = self._get_action_chunk(batch, noise)
+            self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
+
+        return self._queues[ACTION].popleft()
+
+    def forward(self, batch: dict[str, Tensor], noise=None, time=None) -> dict[str, Tensor]:
+        """Do a full training forward pass to compute the loss"""
+        if self.config.adapt_to_pi_aloha:
+            batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
+            batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
             
-        # Create expert model using Gemma3n text architecture
-        self.lm_expert = AutoModel.from_config(lm_expert_config)
-
-        self.num_expert_layers = len(self.lm_expert.layers)
-        self.self_attn_every_n_layers = self_attn_every_n_layers
+        batch = self.normalize_inputs(batch)
+        batch = self.normalize_targets(batch)
         
-        if "cross" in attention_mode:
-            # Reshape qkv projections to match Gemma3n dimensions
-            for layer_idx in range(len(self.lm_expert.layers)):
-                if self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0:
-                    continue
-                    
-                # Gemma3n uses different attention structure
-                self.lm_expert.layers[layer_idx].self_attn.k_proj = nn.Linear(
-                    config.text_config.num_key_value_heads * config.text_config.head_dim,
-                    lm_expert_config.num_key_value_heads * lm_expert_config.head_dim,
-                    bias=lm_expert_config.attention_bias,
-                )
-                self.lm_expert.layers[layer_idx].self_attn.v_proj = nn.Linear(
-                    config.text_config.num_key_value_heads * config.text_config.head_dim,
-                    lm_expert_config.num_key_value_heads * lm_expert_config.head_dim,
-                    bias=lm_expert_config.attention_bias,
-                )
-                
-        # Remove unused embed_tokens from expert
-        self.lm_expert.embed_tokens = None
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        lang_tokens, lang_masks = self.prepare_language(batch)
+        actions = self.prepare_action(batch)
+        actions_is_pad = batch.get("actions_id_pad")
+        
+        loss_dict = {}
+        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        loss_dict["losses_after_forward"] = losses.clone()
 
-        # Gemma3n attention configuration
-        self.num_attention_heads = self.config.text_config.num_attention_heads
-        self.num_key_value_heads = self.config.text_config.num_key_value_heads
+        if actions_is_pad is not None:
+            in_episode_bound = ~actions_is_pad
+            losses = losses * in_episode_bound.unsqueeze(-1)
+            loss_dict["losses_after_in_ep_bound"] = losses.clone()
 
-        self.freeze_vision_encoder = freeze_vision_encoder
-        self.train_expert_only = train_expert_only
-        self.attention_mode = attention_mode
-        self.expert_hidden_size = lm_expert_config.hidden_size
+        # Remove padding
+        losses = losses[:, :, : self.config.max_action_dim]
+        loss_dict["losses_after_rm_padding"] = losses.clone()
+
+        loss = losses.mean()
+        loss_dict["loss"] = loss.item()
+        return loss, loss_dict
+
+    def prepare_images(self, batch):
+        """Apply Gemma3n preprocessing to images."""
+        images = []
+        img_masks = []
+        present_img_keys = [key for key in self.config.image_features if key in batch]
+        missing_img_keys = [key for key in self.config.image_features if key not in batch]
+
+        if len(present_img_keys) == 0:
+            raise ValueError(
+                f"All image features are missing from the batch. At least one expected."
+            )
+
+        # Preprocess image features present in the batch
+        for key in present_img_keys:
+            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
+            if self.config.resize_imgs_with_padding is not None:
+                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+
+            # Gemma3n expects images in [0,1] range, not [-1,1] like SigLIP
+            # No normalization needed as Gemma3n handles this internally
+
+            bsize = img.shape[0]
+            device = img.device
+            if f"{key}_padding_mask" in batch:
+                mask = batch[f"{key}_padding_mask"].bool()
+            else:
+                mask = torch.ones(bsize, dtype=torch.bool, device=device)
+            images.append(img)
+            img_masks.append(mask)
+
+        # Create empty images for missing cameras
+        for num_empty_cameras in range(len(missing_img_keys)):
+            if num_empty_cameras >= self.config.empty_cameras:
+                break
+            img = torch.zeros_like(img)  # Use zeros instead of -1 for Gemma3n
+            mask = torch.zeros_like(mask)
+            images.append(img)
+            img_masks.append(mask)
+            
+        return images, img_masks
+
+    def prepare_language(self, batch) -> tuple[Tensor, Tensor]:
+        """Tokenize the text input using Gemma3n tokenizer."""
+        device = batch[OBS_STATE].device
+        tasks = batch["task"]
+        if isinstance(tasks, str):
+            tasks = [tasks]
+
+        if len(tasks) == 1:
+            tasks = [tasks[0] for _ in range(batch[OBS_STATE].shape[0])]
+
+        tasks = [task if task.endswith("\n") else f"{task}\n" for task in tasks]
+
+        tokenized_prompt = self.language_tokenizer.__call__(
+            tasks,
+            padding=self.config.pad_language_to,
+            padding_side="right",
+            max_length=self.config.tokenizer_max_length,
+            return_tensors="pt",
+        )
+        lang_tokens = tokenized_prompt["input_ids"].to(device=device)
+        lang_masks = tokenized_prompt["attention_mask"].to(device=device, dtype=torch.bool)
+
+        return lang_tokens, lang_masks
+
+    def _pi_aloha_decode_state(self, state):
+        """Convert Aloha state to internal representation."""
+        # Flip the joints
+        for motor_idx in [1, 2, 8, 9]:
+            state[:, motor_idx] *= -1
+        # Reverse the gripper transformation
+        for motor_idx in [6, 13]:
+            state[:, motor_idx] = aloha_gripper_to_angular(state[:, motor_idx])
+        return state
+
+    def _pi_aloha_encode_actions(self, actions):
+        """Convert internal actions to Aloha format."""
+        # Flip the joints
+        for motor_idx in [1, 2, 8, 9]:
+            actions[:, :, motor_idx] *= -1
+        # Apply gripper transformation
+        for motor_idx in [6, 13]:
+            actions[:, :, motor_idx] = aloha_gripper_from_angular(actions[:, :, motor_idx])
+        return actions
+
+    def _pi_aloha_encode_actions_inv(self, actions):
+        """Inverse of _pi_aloha_encode_actions."""
+        # Flip the joints again
+        for motor_idx in [1, 2, 8, 9]:
+            actions[:, :, motor_idx] *= -1
+        # Reverse gripper transformation
+        for motor_idx in [6, 13]:
+            actions[:, :, motor_idx] = aloha_gripper_from_angular_inv(actions[:, :, motor_idx])
+        return actions
+
+    def prepare_state(self, batch):
+        """Pad state vector."""
+        state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+        state = pad_vector(state, self.config.max_state_dim)
+        return state
+
+    def prepare_action(self, batch):
+        """Pad action vector."""
+        actions = pad_vector(batch[ACTION], self.config.max_action_dim)
+        return actions
+
+
+def pad_tensor(tensor, max_len, pad_value=0):
+    """Efficiently pads a tensor along sequence dimension to match max_len."""
+    b, d = tensor.shape[:2]
+
+    padded_tensor = torch.full(
+        (b, max_len, *tensor.shape[2:]), pad_value, dtype=tensor.dtype, device=tensor.device
+    )
+    padded_tensor[:, :d] = tensor
+    return padded_tensor
+
+
+class VLAFlowMatching(nn.Module):
+    """
+    Gemma3nVLA Flow Matching Model
+    
+    Architecture:
+    ┌──────────────────────────────┐
+    │                 actions      │
+    │                    ▲         │
+    │ ┌─────────┐      ┌─|────┐    │
+    │ |         │────► │      │    │
+    │ | Gemma3n │ kv   │      │    │
+    │ |   VLM   │────► │Action│    │
+    │ |  E2B    │cache │Expert│    |
+    │ │         │────► |      │    │
+    │ │         │      │      │    │
+    │ └▲──▲───▲─┘      └───▲──┘    |
+    │  │  |   |            │       |
+    │  |  |   |          noise     │
+    │  │  │ state                  │
+    │  │ language tokens           │
+    │  image(s)                    │
+    └──────────────────────────────┘
+    """
+
+    def __init__(self, config: Gemma3nVLAConfig):
+        super().__init__()
+        self.config = config
+
+        self.vlm_with_expert = Gemma3nWithExpertModel(
+            model_id=self.config.vlm_model_name,
+            freeze_vision_encoder=self.config.freeze_vision_encoder,
+            train_expert_only=self.config.train_expert_only,
+            load_vlm_weights=self.config.load_vlm_weights,
+            attention_mode=self.config.attention_mode,
+            num_expert_layers=self.config.num_expert_layers,
+            num_vlm_layers=self.config.num_vlm_layers,
+            self_attn_every_n_layers=self.config.self_attn_every_n_layers,
+            expert_width_multiplier=self.config.expert_width_multiplier,
+        )
+        
+        # Project state to Gemma3n hidden size
+        self.state_proj = nn.Linear(
+            self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
+        )
+        self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
+        self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
+
+        self.action_time_mlp_in = nn.Linear(
+            self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
+        )
+        self.action_time_mlp_out = nn.Linear(
+            self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
+        )
+
         self.set_requires_grad()
-
-    def get_vlm_model(self):
-        """Get the Gemma3n model (different structure than SmolVLM)."""
-        return self.vlm.model
+        
+        # Gemma3n uses different special tokens
+        self.image_token_id = self.vlm_with_expert.processor.tokenizer.image_token_id
+        self.boi_token_id = self.vlm_with_expert.processor.tokenizer.boi_token_id
+        self.eoi_token_id = self.vlm_with_expert.processor.tokenizer.eoi_token_id
+        
+        self.global_image_start_token = torch.tensor([self.boi_token_id], dtype=torch.long)
+        self.image_end_token = torch.tensor([self.eoi_token_id], dtype=torch.long)
+        
+        self.add_image_special_tokens = self.config.add_image_special_tokens
+        self.prefix_length = self.config.prefix_length
 
     def set_requires_grad(self):
-        """Configure which parameters to train."""
-        if self.freeze_vision_encoder:
-            # Freeze Gemma3n vision tower
-            self.get_vlm_model().vision_tower.eval()
-            for params in self.get_vlm_model().vision_tower.parameters():
-                params.requires_grad = False
-                
-        if self.train_expert_only:
-            self.vlm.eval()
-            for params in self.vlm.parameters():
-                params.requires_grad = False
-        else:
-            # Fine-tune only specific layers
-            last_layers = [self.num_vlm_layers - 1]
-            if (
-                self.num_vlm_layers != self.num_expert_layers
-                and self.num_vlm_layers % self.num_expert_layers == 0
-            ):
-                last_layers.append(self.num_vlm_layers - 2)
-                
-            frozen_layers = [
-                "lm_head",
-                "language_model.norm.weight",  # Gemma3n structure
-            ]
-            for layer in last_layers:
-                frozen_layers.append(f"language_model.layers.{layer}.")
+        for params in self.state_proj.parameters():
+            params.requires_grad = self.config.train_state_proj
 
-            for name, params in self.vlm.named_parameters():
-                if any(k in name for k in frozen_layers):
-                    params.requires_grad = False
-                    
-        # Freeze lm_head in expert
-        for name, params in self.lm_expert.named_parameters():
-            if "lm_head" in name:
-                params.requires_grad = False
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-
-        if self.freeze_vision_encoder:
-            self.get_vlm_model().vision_tower.eval()
-
-        if self.train_expert_only:
-            self.vlm.eval()
-
-    def embed_image(self, image: torch.Tensor):
-        """Embed image using Gemma3n vision encoder."""
-        # Use Gemma3n's vision processing
-        image_features = self.get_vlm_model().get_image_features(
-            pixel_values=image.to(dtype=self.get_vlm_model().vision_tower.timm_model.conv_stem.conv.weight.dtype)
+    def sample_noise(self, shape, device):
+        noise = torch.normal(
+            mean=0.0,
+            std=1.0,
+            size=shape,
+            dtype=torch.float32,
+            device=device,
         )
-        # Convert to float32 for compatibility with training
-        return image_features.to(dtype=torch.float32)
+        return noise
 
-    def embed_language_tokens(self, tokens: torch.Tensor):
-        """Embed language tokens using Gemma3n language model."""
-        return self.get_vlm_model().language_model.embed_tokens(tokens)
+    def sample_time(self, bsize, device):
+        beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
+        time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
+        time = time_beta * 0.999 + 0.001
+        return time
 
-    def forward_attn_layer(
-        self,
-        model_layers,
-        inputs_embeds,
-        layer_idx,
-        position_ids,
-        attention_mask,
-        batch_size,
-        head_dim,
-        use_cache: bool = True,
-        fill_kv_cache: bool = True,
-        past_key_values=None,
-    ) -> list[torch.Tensor]:
-        """Forward pass through attention layer - adapted for Gemma3n."""
-        query_states = []
-        key_states = []
-        value_states = []
+    def embed_prefix(
+        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Embed images with Gemma3n vision encoder and language tokens."""
+        embs = []
+        pad_masks = []
+        att_masks = []
         
-        for i, hidden_states in enumerate(inputs_embeds):
-            layer = model_layers[i][layer_idx]
-            if hidden_states is None or layer is None:
-                continue
-                
-            # Gemma3n uses input_layernorm
-            hidden_states = layer.input_layernorm(hidden_states)
+        for _img_idx, (img, img_mask) in enumerate(zip(images, img_masks, strict=False)):
+            if self.add_image_special_tokens:
+                # Use Gemma3n's begin-of-image token
+                image_start_token = (
+                    self.vlm_with_expert.embed_language_tokens(
+                        self.global_image_start_token.to(device=self.vlm_with_expert.vlm.device)
+                    )
+                    .unsqueeze(0)
+                    .expand(img.shape[0], -1, -1)
+                )
+                image_start_mask = torch.ones_like(
+                    image_start_token[:, :, 0], dtype=torch.bool, device=image_start_token.device
+                )
+                att_masks += [0] * (image_start_mask.shape[-1])
+                embs.append(image_start_token)
+                pad_masks.append(image_start_mask)
 
-            input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+            img_emb = self.vlm_with_expert.embed_image(img)
 
-            hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
+            # Normalize image embeddings
+            img_emb_dim = img_emb.shape[-1]
+            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
+
+            bsize, num_img_embs = img_emb.shape[:2]
+            img_mask = img_mask[:, None].expand(bsize, num_img_embs)
+
+            embs.append(img_emb)
+            pad_masks.append(img_mask)
+            att_masks += [0] * (num_img_embs)
             
-            # Gemma3n attention projections
-            query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
-            key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
-            value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
+            if self.add_image_special_tokens:
+                # Use Gemma3n's end-of-image token
+                image_end_token = (
+                    self.vlm_with_expert.embed_language_tokens(
+                        self.image_end_token.to(device=self.vlm_with_expert.vlm.device)
+                    )
+                    .unsqueeze(0)
+                    .expand(img.shape[0], -1, -1)
+                )
+                image_end_mask = torch.ones_like(
+                    image_end_token[:, :, 0], dtype=torch.bool, device=image_end_token.device
+                )
+                embs.append(image_end_token)
+                pad_masks.append(image_end_mask)
+                att_masks += [0] * (image_end_mask.shape[1])
 
-            query_states.append(query_state)
-            key_states.append(key_state)
-            value_states.append(value_state)
+        # Language embeddings
+        lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
+        lang_emb_dim = lang_emb.shape[-1]
+        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
 
-        # Concatenate embeddings
-        query_states = torch.cat(query_states, dim=1)
-        key_states = torch.cat(key_states, dim=1)
-        value_states = torch.cat(value_states, dim=1)
+        embs.append(lang_emb)
+        pad_masks.append(lang_masks)
+
+        num_lang_embs = lang_emb.shape[1]
+        att_masks += [0] * num_lang_embs
+
+        # State embeddings
+        state_emb = self.state_proj(state)
+        state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
+        embs.append(state_emb)
         
-        seq_len = query_states.shape[1]
-        if seq_len < position_ids.shape[1]:
-            _position_ids = position_ids[:, :seq_len]
-            _attention_mask = attention_mask[:, :seq_len, :seq_len]
-        else:
-            _position_ids = position_ids
-            _attention_mask = attention_mask
+        bsize = state_emb.shape[0]
+        device = state_emb.device
 
-        # Apply RoPE
-        query_states = apply_rope(query_states, _position_ids)
-        key_states = apply_rope(key_states, _position_ids)
+        states_seq_len = state_emb.shape[1]
+        state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=device)
+        pad_masks.append(state_mask)
 
-        if use_cache and past_key_values is None:
-            past_key_values = {}
+        att_masks += [1] * (states_seq_len)
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        att_masks = att_masks[None, :]
 
-        if use_cache:
-            if fill_kv_cache:
-                past_key_values[layer_idx] = {
-                    "key_states": key_states,
-                    "value_states": value_states,
-                }
-            else:
-                key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
-                value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
+        seq_len = pad_masks.shape[1]
+        if seq_len < self.prefix_length:
+            embs = pad_tensor(embs, self.prefix_length, pad_value=0)
+            pad_masks = pad_tensor(pad_masks, self.prefix_length, pad_value=0)
+            att_masks = pad_tensor(att_masks, self.prefix_length, pad_value=0)
 
-        attention_interface = self.get_attention_interface()
-        att_output = attention_interface(
-            _attention_mask, batch_size, head_dim, query_states, key_states, value_states
+        att_masks = att_masks.expand(bsize, -1)
+        return embs, pad_masks, att_masks
+
+    def embed_suffix(self, noisy_actions, timestep):
+        """Embed state, noisy_actions, timestep for Expert processing."""
+        embs = []
+        pad_masks = []
+        att_masks = []
+
+        # Fuse timestep + action information
+        action_emb = self.action_in_proj(noisy_actions)
+        device = action_emb.device
+        bsize = action_emb.shape[0]
+        dtype = action_emb.dtype
+        
+        # Timestep embedding
+        time_emb = create_sinusoidal_pos_embedding(
+            timestep,
+            self.vlm_with_expert.expert_hidden_size,
+            self.config.min_period,
+            self.config.max_period,
+            device=device,
         )
-        return [att_output], past_key_values
+        time_emb = time_emb.type(dtype=dtype)
 
-    def forward_cross_attn_layer(
-        self,
-        model_layers,
-        inputs_embeds,
-        layer_idx,
-        position_ids,
-        attention_mask,
-        batch_size,
-        head_dim,
-        use_cache: bool = True,
-        fill_kv_cache: bool = True,
-        past_key_values=None,
-    ) -> list[torch.Tensor]:
-        """Cross-attention layer forward pass."""
-        attention_interface = self.get_attention_interface()
-        att_outputs = []
-        
-        assert len(inputs_embeds) == 2 or (use_cache and past_key_values is not None and not fill_kv_cache)
+        time_emb = time_emb[:, None, :].expand_as(action_emb)
+        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
-        if len(inputs_embeds) == 2 and not past_key_values:
-            # Prefix attention
-            seq_len = inputs_embeds[0].shape[1]
-            position_id, expert_position_id = position_ids[:, :seq_len], position_ids[:, seq_len:]
-            prefix_attention_mask = attention_mask[:, :seq_len, :seq_len]
+        action_time_emb = self.action_time_mlp_in(action_time_emb)
+        action_time_emb = F.silu(action_time_emb)
+        action_time_emb = self.action_time_mlp_out(action_time_emb)
 
-            layer = model_layers[0][layer_idx]
-            hidden_states = layer.input_layernorm(inputs_embeds[0])
+        embs.append(action_time_emb)
 
-            input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+        bsize, action_time_dim = action_time_emb.shape[:2]
+        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
+        pad_masks.append(action_time_mask)
 
-            hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
-            query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
-            key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
-            value_states = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
-
-            query_states = apply_rope(query_state, position_id)
-            key_states = apply_rope(key_state, position_id)
-
-            att_output = attention_interface(
-                prefix_attention_mask, batch_size, head_dim, query_states, key_states, value_states
-            )
-            att_outputs.append(att_output)
-        else:
-            expert_position_id = position_ids
-
-        if use_cache and past_key_values is None:
-            past_key_values = {}
-
-        if use_cache:
-            if fill_kv_cache:
-                past_key_values[layer_idx] = {
-                    "key_states": key_states,
-                    "value_states": value_states,
-                }
-            else:
-                key_states = past_key_values[layer_idx]["key_states"]
-                value_states = past_key_values[layer_idx]["value_states"]
-
-        # Expert layer processing
-        expert_layer = model_layers[1][layer_idx]
-        if expert_layer is not None:
-            expert_hidden_states = expert_layer.input_layernorm(inputs_embeds[1])
-
-            expert_input_shape = expert_hidden_states.shape[:-1]
-            expert_hidden_shape = (*expert_input_shape, -1, expert_layer.self_attn.head_dim)
-
-            expert_hidden_states = expert_hidden_states.to(dtype=expert_layer.self_attn.q_proj.weight.dtype)
-            expert_query_state = expert_layer.self_attn.q_proj(expert_hidden_states).view(expert_hidden_shape)
-
-            # Project VLM key-value states to expert dimensions
-            _key_states = key_states.to(dtype=expert_layer.self_attn.k_proj.weight.dtype).view(
-                *key_states.shape[:2], -1
-            )
-            expert_key_states = expert_layer.self_attn.k_proj(_key_states).view(
-                *_key_states.shape[:-1], -1, expert_layer.self_attn.head_dim
-            )
-
-            _value_states = value_states.to(dtype=expert_layer.self_attn.v_proj.weight.dtype).view(
-                *value_states.shape[:2], -1
-            )
-            expert_value_states = expert_layer.self_attn.v_proj(_value_states).view(
-                *_value_states.shape[:-1], -1, expert_layer.self_attn.head_dim
-            )
-
-            expert_position_id = (
-                expert_position_id - torch.min(expert_position_id, dim=1, keepdim=True).values
-            )
-            expert_attention_mask = attention_mask[
-                :, -inputs_embeds[1].shape[1] :, : expert_key_states.shape[1] :
-            ]
-
-            expert_query_states = apply_rope(expert_query_state, expert_position_id)
-
-            att_output = attention_interface(
-                expert_attention_mask,
-                batch_size,
-                head_dim,
-                expert_query_states,
-                expert_key_states,
-                expert_value_states,
-            )
-            att_outputs.append(att_output)
-        else:
-            att_outputs.append(None)
-
-        return att_outputs, past_key_values
-
-    def get_model_layers(self, models: list) -> list:
-        """Get layer mapping between VLM and expert models."""
-        vlm_layers = []
-        expert_layers = []
-        multiple_of = self.num_vlm_layers // self.num_expert_layers
-        
-        for i in range(self.num_vlm_layers):
-            if multiple_of > 0 and i > 0 and i % multiple_of != 0:
-                expert_layer = None
-            else:
-                expert_layer_index = i // multiple_of if multiple_of > 0 else i
-                expert_layer = models[1].layers[expert_layer_index]
-            vlm_layers.append(models[0].layers[i])
-            expert_layers.append(expert_layer)
-        return [vlm_layers, expert_layers]
+        att_masks += [1] * self.config.chunk_size
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        return embs, pad_masks, att_masks
 
     def forward(
-        self,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: list[torch.FloatTensor] | None = None,
-        inputs_embeds: list[torch.FloatTensor] = None,
-        use_cache: bool | None = None,
-        fill_kv_cache: bool | None = None,
-    ):
-        """Main forward pass through Gemma3n + Expert architecture."""
-        # Use Gemma3n language model + expert
-        models = [self.get_vlm_model().language_model, self.lm_expert]
-        model_layers = self.get_model_layers(models)
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+    ) -> Tensor:
+        """Training forward pass with flow matching loss."""
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
+
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
+
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
         
-        for hidden_states in inputs_embeds:
-            if hidden_states is None:
-                continue
-            batch_size = hidden_states.shape[0]
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
-        num_layers = self.num_vlm_layers
-        head_dim = self.vlm.config.text_config.head_dim
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
         
-        for layer_idx in range(num_layers):
-            if (
-                fill_kv_cache
-                or "cross" not in self.attention_mode
-                or (self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0)
-            ):
-                att_outputs, past_key_values = self.forward_attn_layer(
-                    model_layers,
-                    inputs_embeds,
-                    layer_idx,
-                    position_ids,
-                    attention_mask,
-                    batch_size,
-                    head_dim,
-                    use_cache=use_cache,
-                    fill_kv_cache=fill_kv_cache,
-                    past_key_values=past_key_values,
-                )
-            else:
-                att_outputs, past_key_values = self.forward_cross_attn_layer(
-                    model_layers,
-                    inputs_embeds,
-                    layer_idx,
-                    position_ids,
-                    attention_mask,
-                    batch_size,
-                    head_dim,
-                    use_cache=use_cache,
-                    fill_kv_cache=fill_kv_cache,
-                    past_key_values=past_key_values,
-                )
-                
-            outputs_embeds = []
-            start = 0
-            
-            for i, hidden_states in enumerate(inputs_embeds):
-                layer = model_layers[i][layer_idx]
-                att_output = (
-                    att_outputs[i] if i < len(att_outputs) else att_outputs[0]
-                )
-                
-                if hidden_states is not None:
-                    if layer is None:
-                        outputs_embeds.append(hidden_states)
-                        continue
-                        
-                    end = start + hidden_states.shape[1]
-
-                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-                        
-                    att_out = att_output[:, start:end]
-                    out_emb = layer.self_attn.o_proj(att_out)
-
-                    out_emb += hidden_states
-                    after_first_residual = out_emb.clone()
-
-                    # Gemma3n uses post_attention_layernorm
-                    out_emb = layer.post_attention_layernorm(out_emb)
-                    out_emb = layer.mlp(out_emb)
-
-                    out_emb += after_first_residual
-                    outputs_embeds.append(out_emb)
-
-                    start = end if len(att_outputs) == 1 else 0
-                else:
-                    outputs_embeds.append(None)
-
-            inputs_embeds = outputs_embeds
-
-        # Final normalization
-        outputs_embeds = []
-        for i, hidden_states in enumerate(inputs_embeds):
-            if hidden_states is not None:
-                out_emb = models[i].norm(hidden_states)
-                outputs_embeds.append(out_emb)
-            else:
-                outputs_embeds.append(None)
-                
-        return outputs_embeds, past_key_values
-
-    def get_attention_interface(self):
-        """Get attention implementation."""
-        return self.eager_attention_forward
-
-    def eager_attention_forward(
-        self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
-    ):
-        """Eager attention implementation adapted for Gemma3n."""
-        num_att_heads = self.num_attention_heads
-        num_key_value_heads = self.num_key_value_heads
-        num_key_value_groups = num_att_heads // num_key_value_heads
-
-        sequence_length = key_states.shape[1]
-
-        # Expand key and value states for grouped query attention
-        key_states = key_states[:, :, :, None, :].expand(
-            batch_size, sequence_length, num_key_value_heads, num_key_value_groups, head_dim
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
         )
-        key_states = key_states.reshape(
-            batch_size, sequence_length, num_key_value_heads * num_key_value_groups, head_dim
-        )
-
-        value_states = value_states[:, :, :, None, :].expand(
-            batch_size, sequence_length, num_key_value_heads, num_key_value_groups, head_dim
-        )
-        value_states = value_states.reshape(
-            batch_size, sequence_length, num_key_value_heads * num_key_value_groups, head_dim
-        )
-
-        # Upcast to float32 for numerical stability
-        query_states = query_states.to(dtype=torch.float32)
-        key_states = key_states.to(dtype=torch.float32)
-
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-
-        # Compute attention scores
-        att_weights = torch.matmul(query_states, key_states.transpose(2, 3))
-        att_weights *= head_dim**-0.5
-
-        att_weights = att_weights.to(dtype=torch.float32)
-        big_neg = torch.finfo(att_weights.dtype).min
-        masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg)
         
-        probs = nn.functional.softmax(masked_att_weights, dim=-1)
-        probs = probs.to(dtype=value_states.dtype)
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        v_t = self.action_out_proj(suffix_out)
+        losses = F.mse_loss(u_t, v_t, reduction="none")
+        return losses
 
-        att_output = torch.matmul(probs, value_states.permute(0, 2, 1, 3))
-        att_output = att_output.permute(0, 2, 1, 3)
-        att_output = att_output.reshape(batch_size, -1, num_key_value_heads * num_key_value_groups * head_dim)
+    def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None) -> Tensor:
+        """Inference forward pass to sample actions."""
+        bsize = state.shape[0]
+        device = state.device
 
-        return att_output
+        if noise is None:
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        
+        # Compute image and language key value cache
+        _, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+        )
+        
+        dt = -1.0 / self.config.num_steps
+        dt = torch.tensor(dt, dtype=torch.float32, device=device)
+
+        x_t = noise
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        
+        while time >= -dt / 2:
+            expanded_time = time.expand(bsize)
+            v_t = self.denoise_step(
+                prefix_pad_masks,
+                past_key_values,
+                x_t,
+                expanded_time,
+            )
+            # Euler step
+            x_t += dt * v_t
+            time += dt
+        return x_t
+
+    def denoise_step(self, prefix_pad_masks, past_key_values, x_t, timestep):
+        """Apply one denoising step."""
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+        outputs_embeds, _ = self.vlm_with_expert.forward(
+            attention_mask=full_att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=False,
+        )
+        
+        suffix_out = outputs_embeds[1]
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        v_t = self.action_out_proj(suffix_out)
+        return v_t

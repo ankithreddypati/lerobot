@@ -208,7 +208,8 @@ class Gemma3nWithExpertModel(nn.Module):
         image_features = self.get_vlm_model().get_image_features(
             pixel_values=image.to(dtype=self.get_vlm_model().vision_tower.timm_model.conv_stem.conv.weight.dtype)
         )
-        return image_features
+        # Convert to float32 for compatibility with training
+        return image_features.to(dtype=torch.float32)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         """Embed language tokens using Gemma3n language model."""
