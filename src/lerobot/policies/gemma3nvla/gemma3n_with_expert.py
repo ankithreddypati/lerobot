@@ -104,7 +104,8 @@ class Gemma3nWithExpertModel(nn.Module):
         lm_expert_config = copy.deepcopy(config.text_config)
         hidden_size = lm_expert_config.hidden_size
         lm_expert_config.hidden_size = int(hidden_size * expert_width_multiplier)
-        lm_expert_config.intermediate_size = get_intermediate_size(int(hidden_size * expert_width_multiplier))
+        expert_intermediate_size = get_intermediate_size(int(hidden_size * expert_width_multiplier))
+        lm_expert_config.intermediate_size = [expert_intermediate_size] * self.num_vlm_layers
         lm_expert_config.num_hidden_layers = self.num_vlm_layers
         
         if num_expert_layers > 0:
