@@ -75,7 +75,7 @@ class Gemma3nWithExpertModel(nn.Module):
     ):
         super().__init__()
         
-        if load_vlm_weights:
+        if load_vlm_weights or train_expert_only:
             print(f"Loading Gemma3n {model_id} weights ...")
             self.vlm = Gemma3nForConditionalGeneration.from_pretrained(
                 model_id,

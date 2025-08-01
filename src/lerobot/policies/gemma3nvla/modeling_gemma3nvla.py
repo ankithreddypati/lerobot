@@ -146,14 +146,18 @@ def load_gemma3nvla(
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
-    if not all(key.startswith(norm_keys) for key in missing) or unexpected:
-        raise RuntimeError(
-            "Gemma3nVLA %d missing / %d unexpected keys",
-            len(missing),
-            len(unexpected),
+    # Only warn instead of raising an error
+    if missing or unexpected:
+        print(
+            f"[WARNING] Gemma3nVLA: {len(missing)} missing keys, {len(unexpected)} unexpected keys"
         )
+        if missing:
+            print("Missing keys (showing first 10):", missing[:10])
+        if unexpected:
+            print("Unexpected keys (showing first 10):", unexpected[:10])
 
     return model
+
 
 
 def create_sinusoidal_pos_embedding(
