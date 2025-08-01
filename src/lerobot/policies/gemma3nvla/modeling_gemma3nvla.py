@@ -140,13 +140,9 @@ def load_gemma3nvla(
 
     state_dict, _ = standardise_state_dict(state_dict, set(model.state_dict().keys()))
 
-    # Don't overwrite normalization parameters
-    norm_keys = ("normalize_inputs", "normalize_targets", "unnormalize_outputs")
-    state_dict = {k: v for k, v in state_dict.items() if not k.startswith(norm_keys)}
-
+    # ✅ Keep all keys, including normalize_* and unnormalize_*
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
-    # Only warn instead of raising an error
     if missing or unexpected:
         print(
             f"[WARNING] Gemma3nVLA: {len(missing)} missing keys, {len(unexpected)} unexpected keys"
@@ -157,6 +153,7 @@ def load_gemma3nvla(
             print("Unexpected keys (showing first 10):", unexpected[:10])
 
     return model
+
 
 
 
