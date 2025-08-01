@@ -33,11 +33,11 @@ def apply_rope(x, positions, max_wavelength=10_000):
     d_half = x.shape[-1] // 2
     device = x.device
     dtype = x.dtype
-    x = x.to(torch.float32)
-
-    freq_exponents = (2.0 / x.shape[-1]) * torch.arange(d_half, dtype=torch.float32, device=device)
+    
+    # Keep original dtype instead of forcing float32
+    freq_exponents = (2.0 / x.shape[-1]) * torch.arange(d_half, dtype=dtype, device=device)
     timescale = max_wavelength**freq_exponents
-    radians = positions[..., None].to(torch.float32) / timescale[None, None, :].to(torch.float32)
+    radians = positions[..., None].to(dtype) / timescale[None, None, :].to(dtype)
 
     radians = radians[..., None, :]
 
@@ -49,7 +49,7 @@ def apply_rope(x, positions, max_wavelength=10_000):
     res[..., :d_half] = x1 * cos - x2 * sin
     res[..., d_half:] = x2 * cos + x1 * sin
 
-    return res.to(dtype)
+    return res
 
 
 def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
@@ -80,7 +80,7 @@ class Gemma3nWithExpertModel(nn.Module):
             self.vlm = Gemma3nForConditionalGeneration.from_pretrained(
                 model_id,
                 device_map="auto",
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.bfloat16,  # Keep BFloat16
                 low_cpu_mem_usage=True,
                 attn_implementation="sdpa",
             )
@@ -115,8 +115,11 @@ class Gemma3nWithExpertModel(nn.Module):
             )
             lm_expert_config.num_hidden_layers = num_expert_layers
             
-        # Create expert model using Gemma3n text architecture
-        self.lm_expert = AutoModel.from_config(lm_expert_config)
+        #  FIX: Create expert model in BFloat16 to match VLM
+        self.lm_expert = AutoModel.from_config(
+            lm_expert_config,
+            torch_dtype=torch.bfloat16  # Add this to match VLM precision!
+        )
 
         self.num_expert_layers = len(self.lm_expert.layers)
         self.self_attn_every_n_layers = self_attn_every_n_layers
@@ -132,11 +135,13 @@ class Gemma3nWithExpertModel(nn.Module):
                     config.text_config.num_key_value_heads * config.text_config.head_dim,
                     lm_expert_config.num_key_value_heads * lm_expert_config.head_dim,
                     bias=lm_expert_config.attention_bias,
+                    dtype=torch.bfloat16  # Ensure BFloat16
                 )
                 self.lm_expert.layers[layer_idx].self_attn.v_proj = nn.Linear(
                     config.text_config.num_key_value_heads * config.text_config.head_dim,
                     lm_expert_config.num_key_value_heads * lm_expert_config.head_dim,
                     bias=lm_expert_config.attention_bias,
+                    dtype=torch.bfloat16  # Ensure BFloat16
                 )
                 
         # Remove unused embed_tokens from expert
@@ -204,10 +209,10 @@ class Gemma3nWithExpertModel(nn.Module):
 
     def embed_image(self, image: torch.Tensor):
         """Embed image using Gemma3n vision encoder."""
-        # Ensure input is float32 to avoid dtype mismatches
-        image = image.to(dtype=torch.float32)
+        #  FIX: Keep in BFloat16 instead of converting to Float32
+        image = image.to(dtype=torch.bfloat16)
         
-        # Get vision features directly from vision tower to avoid embed_vision dtype issues
+        # Get vision features directly from vision tower
         vision_outputs = self.get_vlm_model().vision_tower(
             pixel_values=image, do_pooling=False, return_dict=True
         ).last_hidden_state
@@ -222,11 +227,14 @@ class Gemma3nWithExpertModel(nn.Module):
         # Apply scaling
         vision_outputs *= self.config.vision_config.hidden_size**0.5
         
-        # Use embed_vision but ensure float32
-        vision_outputs = vision_outputs.to(dtype=torch.float32)
+        #  FIX: Ensure dtype compatibility for embed_vision
+        vision_outputs = vision_outputs.to(
+            dtype=self.get_vlm_model().embed_vision.weight.dtype
+        )
         embedded_features = self.get_vlm_model().embed_vision(inputs_embeds=vision_outputs)
         
-        return embedded_features.to(dtype=torch.float32)
+        #  FIX: Return in BFloat16 instead of Float32
+        return embedded_features
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         """Embed language tokens using Gemma3n language model."""
@@ -285,7 +293,7 @@ class Gemma3nWithExpertModel(nn.Module):
             _position_ids = position_ids
             _attention_mask = attention_mask
 
-        # Apply RoPE
+        # Apply RoPE - now respects original dtype
         query_states = apply_rope(query_states, _position_ids)
         key_states = apply_rope(key_states, _position_ids)
 
@@ -564,9 +572,15 @@ class Gemma3nWithExpertModel(nn.Module):
             batch_size, sequence_length, num_key_value_heads * num_key_value_groups, head_dim
         )
 
-        # Upcast to float32 for numerical stability
-        query_states = query_states.to(dtype=torch.float32)
-        key_states = key_states.to(dtype=torch.float32)
+        #  FIX: Only upcast to float32 for attention computation if needed for stability
+        # Most modern hardware can handle bfloat16 attention
+        original_dtype = query_states.dtype
+        
+        # Only upcast if we're not already in a stable precision
+        if original_dtype == torch.float16:  # float16 can be unstable
+            query_states = query_states.to(dtype=torch.float32)
+            key_states = key_states.to(dtype=torch.float32)
+        # Keep bfloat16 or float32 as-is (both are stable)
 
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
@@ -575,7 +589,6 @@ class Gemma3nWithExpertModel(nn.Module):
         att_weights = torch.matmul(query_states, key_states.transpose(2, 3))
         att_weights *= head_dim**-0.5
 
-        att_weights = att_weights.to(dtype=torch.float32)
         big_neg = torch.finfo(att_weights.dtype).min
         masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg)
         
@@ -585,5 +598,9 @@ class Gemma3nWithExpertModel(nn.Module):
         att_output = torch.matmul(probs, value_states.permute(0, 2, 1, 3))
         att_output = att_output.permute(0, 2, 1, 3)
         att_output = att_output.reshape(batch_size, -1, num_key_value_heads * num_key_value_groups * head_dim)
+
+        # Convert back to original dtype if we upcasted
+        if original_dtype == torch.float16:
+            att_output = att_output.to(dtype=original_dtype)
 
         return att_output
