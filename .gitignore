@@ -173,3 +173,8 @@ outputs/
 
 # Dev folders
 .cache/*
+
+torch-*.whl
+torchaudio-*.whl
+torchvision-*.whl
+pytorch_triton_*.whl

@@ -227,14 +227,13 @@ class Gemma3nWithExpertModel(nn.Module):
         # Apply scaling
         vision_outputs *= self.config.vision_config.hidden_size**0.5
         
-        #  FIX: Smart dtype handling for embed_vision
+        #  Smart dtype handling for embed_vision
         # embed_vision is a complex module, not a simple linear layer
         try:
             # Try to get dtype from the first parameter of embed_vision
             embed_vision_dtype = next(self.get_vlm_model().embed_vision.parameters()).dtype
             vision_outputs = vision_outputs.to(dtype=embed_vision_dtype)
         except (StopIteration, AttributeError):
-            # Fallback: keep in bfloat16 if we can't determine the dtype
             pass
             
         embedded_features = self.get_vlm_model().embed_vision(inputs_embeds=vision_outputs)
@@ -583,10 +582,9 @@ class Gemma3nWithExpertModel(nn.Module):
         original_dtype = query_states.dtype
         
         # Only upcast if we're not already in a stable precision
-        if original_dtype == torch.float16:  # float16 can be unstable
+        if original_dtype == torch.float16:
             query_states = query_states.to(dtype=torch.float32)
             key_states = key_states.to(dtype=torch.float32)
-        # Keep bfloat16 or float32 as-is (both are stable)
 
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)

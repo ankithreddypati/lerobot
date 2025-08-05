@@ -40,6 +40,7 @@ import torch
 from lerobot.policies.factory import get_policy_class
 from lerobot.scripts.server.configs import PolicyServerConfig
 from lerobot.scripts.server.constants import SUPPORTED_POLICIES
+from lerobot.policies.gemma3nvla.configuration_gemma3nvla import Gemma3nVLAConfig
 from lerobot.scripts.server.helpers import (
     FPSTracker,
     Observation,

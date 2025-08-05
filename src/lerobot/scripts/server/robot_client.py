@@ -49,6 +49,7 @@ import torch
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.gemma3nvla.configuration_gemma3nvla import Gemma3nVLAConfig
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,

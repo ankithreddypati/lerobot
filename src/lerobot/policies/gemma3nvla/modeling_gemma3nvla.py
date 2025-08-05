@@ -26,21 +26,22 @@ pip install -e ".[gemma3nvla]"
 
 Example of finetuning the gemma3nvla pretrained model:
 ```bash
-python -m lerobot.scripts.train \
---policy.path=lerobot/gemma3nvla_base \
---dataset.repo_id=your_dataset \
---batch_size=32 \
---steps=200000
+!cd lerobot && python -m lerobot.scripts.train \
+  --policy.type=gemma3nvla \
+  --policy.num_vlm_layers=4 \
+  --policy.repo_id=${HF_USER}/model_name \
+  --dataset.repo_id=${HF_USER}/your_dataset \
+  --dataset.video_backend=pyav \
+  --batch_size=64 \
+  --steps=20000 \
+  --save_freq=10000 \
+  --output_dir=outputs/train/gemma3nvla_v0 \
+  --job_name=gemma3nvla_test_v0 \
+  --policy.device=cuda \
+  --wandb.enable=true
 ```
 
-Example of finetuning from scratch:
-```bash
-python -m lerobot.scripts.train \
---policy.type=gemma3nvla \
---dataset.repo_id=your_dataset \
---batch_size=32 \
---steps=200000
-```
+
 """
 
 import math
