@@ -15,7 +15,7 @@ pip install -e ".[async]"
 
 ```
 
-## 🏗️ Gemma3nVLA Architecture
+## Gemma3nVLA Architecture
 
 ### Overview
 
@@ -144,7 +144,7 @@ python -m lerobot.scripts.train \
   --wandb.enable=true
 ```
 
-#### **🔗 Colab Fine-tuning Tutorial**
+#### ** Colab Fine-tuning Tutorial**
 For an interactive fine-tuning experience, check out [Google Colab tutorial](https://colab.research.google.com/drive/1-gZRbKM1wiLcafGUIfzYxKi7QYprIuE2) 
 
 ### Optimization Techniques
@@ -183,10 +183,6 @@ python3 -m lerobot.scripts.server.robot_client \
     --aggregate_fn_name=weighted_average
 ```
 
-
-
-This project was developed as part of **The Gemma 3n Impact Challenge**, where it achieved **~80% success rate** on pick and place tasks using the Gemma3nVLA architecture.
-
 ###  Dataset
 - **Dataset**: [SO101 Pick & Place Tools Dataset](https://huggingface.co/datasets/ankithreddy/so101_pickplace_tools)
 - **Task**: Pick and place manipulation 
@@ -195,7 +191,3 @@ This project was developed as part of **The Gemma 3n Impact Challenge**, where i
 - **Model**: [Gemma3nVLA LeRepairBot v0](https://huggingface.co/ankithreddy/gemma3nvla_lerepairbot_v0)
 - **Base Model**: Google Gemma-3n-E2B
 
-###  Deployment Architecture
-- **Primary Model**: Running on AMD pc with rocm 
-- **RAG Server**: Separate server with retrieval-augmented generation capabilities
-- **Integration**: RAG LLM server triggers this model for task execution
